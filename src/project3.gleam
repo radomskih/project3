@@ -52,7 +52,6 @@ pub fn get_next_hop(key: Int, state: State) -> #(Int, Subject(Message)) {
     }
     False -> {
       //try to get as close as possible without overshooting
-      let assert Some(self) = state.self
       closest_preceding_node(key, state)
     }
   }
@@ -138,7 +137,7 @@ pub fn get_routing_position(key: Int, start: Int) -> Int {
 
   //measuring distance from start key
   let diff = distance(start, key)
-  let diff_float = int.to_float(diff)
+  let diff_float = int.to_float(diff) +. 0.001
 
   //get log_2 of difference
   let log_val = log2(diff_float)
@@ -241,7 +240,7 @@ pub fn closest_following_node(
 
 pub fn distance(start: Int, end: Int) -> Int {
   //TODO: CHANGE TO FINAL VALUE
-  let circle_size = 1000
+  let circle_size = 10_000
   //this value can either be positive or negative
   let diff = end - start
   //if diff is negative, we must wrap around the circle
@@ -425,7 +424,7 @@ fn worker_handle_message(
       actor.continue(new_state)
     }
 
-    Response(sender, sender_id, hops) -> {
+    Response(sender, sender_id, _hops) -> {
       io.println("received a response")
       //update contacts with sender's info
       let new_state = update_state(sender, sender_id, state)
