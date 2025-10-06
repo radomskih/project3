@@ -7,8 +7,17 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/pair
-
+import gleam/results
 pub fn main() -> Nil {
+  let _num_nodes = 10
+  let num_resources = 100
+  //Generate a number of resources by hashing intergers from 1 to num_resources
+  let keys = create_keys(num_resources)
+  //sort keys so they are in order on the chord circle
+  keys = sort(new_list, int.compare)
+stant  nodes = sort(new_list, int.compare)
+  let chord_ring = list.append(keys, nodes)
+  chord_ring = sort(chord_ring, int.compare)
   let actor_state = State(None, 0, None, 0, dict.new(), [], 0)
   let assert Ok(node) =
     actor.new(actor_state)
@@ -19,6 +28,94 @@ pub fn main() -> Nil {
   actor.send(node.data, Start(node.data))
   process.sleep(5000)
   Nil
+}
+
+fn create_keys(index: Int) -> List(Int) {
+  case index {
+    1 -> {
+      let digest =
+        crypto.hash(crypto.Sha1, bit_array.from_string(int.to_string(index)))
+      let hex = bit_array.base16_encode(digest)
+      let assert Ok(num) = int.base_parse(hex, 16)
+      [num]
+    }
+    _ -> {
+      let new_index = index - 1
+      let existing_list = create_keys(new_index)
+
+      let digest =
+        crypto.hash(crypto.Sha1, bit_array.from_string(int.to_string(index)))
+      let hex = bit_array.base16_encode(digest)
+      let assert Ok(num) = int.base_parse(hex, 16)
+
+      let new_list = list.append(existing_list, [num])
+    }
+  }
+}
+
+fn create_nodes(index: Int) -> List(Int) {
+  case index {
+    1 -> {
+      let num = key_hash(index)
+      [num]
+    }
+    _ -> {
+      let new_index = index - 1
+      let existing_list = create_keys(new_index)
+
+      let num = key_hash(index)
+      let new_list = list.append(existing_list, [num])
+    }
+  }
+}
+
+fn key_hash(key: String) -> Int{
+  let digest = crypto.hash(crypto.Sha1, bit_array.from_string(int.to_string(index)))
+  let hex = bit_array.base16_encode(digest)
+  let assert Ok(num) = int.base_parse(hex, 16)
+}
+
+pub type TableState{
+  TableState (
+    nodes: List(Int),
+    keys: List(Int),
+    chord: List(Int)
+  )
+}
+
+pub type TableMsg{
+  //Updates lists made in main
+  Update(nodes: List(Int), keys: List(Int))
+  //Search for node responsible for resources
+  SearchNode(String)
+}
+
+fn table_handle_message( state: TableState, message: TableMsg) -> actor.Next(TableState, TableMsg){
+  case message{
+    Update(nodes, keys){
+      let chord = list.append(nodes, keys)
+      chord = list.sor
+      let new_state = TableState(nodes, keys)
+      actor.continue(new_state)
+    }
+    SearchNode(resource){
+      //get hash for resource request
+      let resource_hash = key_hash(resource)
+      //make sure resource exists
+      let resource = list.contains(resources, resource_hash)
+      case resources {
+        True -> {
+
+        }
+      }
+
+
+    }
+  }
+}
+
+pub fn search_finger_table(start_index: Int, index: Int) -> Result(Bool, Int){
+  
 }
 
 pub fn lookup(state: State) {
@@ -233,6 +330,8 @@ pub type State {
     //keep successor info for easy access during requests
     succ: Option(Subject(Message)),
     succ_id: Int,
+    pred: Option(Subject(Message)),
+    pred_id: Int,
     //keep list of other contacts for larger hops
     contacts: dict.Dict(Int, Subject(Message)),
     //keep list of keys you own
@@ -354,6 +453,7 @@ fn worker_handle_message(
       //update your contacts with their info
 
       //if sender id is within your current range, you are their successor
+      //CHANGE current node's id and successor node's id, if true return succ_id, if false check finger table for highest preceding node
       case sender_id >= state.starter_key && sender_id < state.self_id {
         True -> {
           //you are their successor
