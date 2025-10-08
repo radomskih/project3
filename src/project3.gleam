@@ -1,3 +1,5 @@
+import gleam/bit_array
+import gleam/crypto
 import gleam/dict
 import gleam/erlang/process.{type Subject, send_after}
 import gleam/float
@@ -7,18 +9,111 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/pair
+import gleam/string
+
+//import gleam/results
 
 pub fn main() -> Nil {
-  let actor_state = State(None, 0, None, 0, None, 0, dict.new())
-  let assert Ok(node) =
-    actor.new(actor_state)
-    |> actor.on_message(worker_handle_message)
-    |> actor.start
-
+  let num_nodes = 30
+  let num_resources = 100
+  //Generate a number of resources by hashing intergers from 1 to num_resources
+  let _keys = create_keys(num_resources)
+  //generate n nodes to be joined to the chord
+  let nodes_dict = create_nodes(num_nodes)
+  //for cheaper iteration
+  let nodes_list = dict.to_list(nodes_dict)
+  echo nodes_list
+  //build chord
+  build_chord(num_nodes, nodes_list)
   io.println("starting node")
-  actor.send(node.data, Start(node.data))
+  //actor.send(node.data, Start(node.data))
   process.sleep(5000)
   Nil
+}
+
+fn key_hash(key: String) -> Int {
+  let digest = crypto.hash(crypto.Sha1, bit_array.from_string(key))
+  let hex = bit_array.base16_encode(digest)
+  let assert Ok(num) = int.base_parse(hex, 16)
+  num
+}
+
+fn create_keys(index: Int) -> List(Int) {
+  case index {
+    1 -> {
+      let hash = key_hash(int.to_string(index))
+      [hash]
+    }
+    _ -> {
+      let existing_list = create_keys(index - 1)
+
+      let hash = key_hash(int.to_string(index))
+      let new_list = list.append(existing_list, [hash])
+      new_list
+    }
+  }
+}
+
+fn create_nodes(index: Int) -> dict.Dict(Int, Subject(Message)) {
+  case index {
+    1 -> {
+      let actor_state = State(None, 0, None, 0, None, 0, dict.new())
+      let assert Ok(node) =
+        actor.new(actor_state)
+        |> actor.on_message(worker_handle_message)
+        |> actor.start
+      let hash = key_hash(string.inspect(node.pid))
+      let nodes = dict.new()
+      let nodes = dict.insert(nodes, hash, node.data)
+      nodes
+    }
+    _ -> {
+      let new_index = index - 1
+      let nodes = create_nodes(new_index)
+
+      let actor_state = State(None, 0, None, 0, None, 0, dict.new())
+      let assert Ok(node) =
+        actor.new(actor_state)
+        |> actor.on_message(worker_handle_message)
+        |> actor.start
+      let hash = key_hash(string.inspect(node.pid))
+      let nodes = dict.insert(nodes, hash, node.data)
+      nodes
+    }
+  }
+}
+
+fn build_chord(
+  index: Int,
+  nodes: List(#(Int, Subject(Message))),
+) -> #(Subject(Message), Int) {
+  case index {
+    1 -> {
+      //Get node's addr to join
+      let assert Ok(node) = list.first(nodes)
+      let subject = pair.second(node)
+      let id = pair.first(node)
+      //Join with no successor and no predesssor responsible for all nodes
+      //create a function for just 1 node in that is responsbile for all nodes
+      //TODO
+
+      //pass back this node as the reference for the next node
+      #(subject, id)
+    }
+    _ -> {
+      //remove self from list and pass the list along
+      let assert Ok(node) = list.first(nodes)
+      let subject = pair.second(node)
+      let id = pair.first(node)
+      let assert Ok(nodes) = list.rest(nodes)
+      //get reference node from the node before you
+      let ref_node = build_chord(index - 1, nodes)
+      let ref_id = pair.first(ref_node)
+      let ref_subject = pair.second(ref_node)
+      actor.send(subject, Join(subject, ref_id, ref_subject))
+      #(subject, id)
+    }
+  }
 }
 
 pub fn lookup(state: State) {
@@ -372,7 +467,6 @@ fn worker_handle_message(
       send_after(self, 2000, StabilizeTrigger)
       actor.continue(new_state)
     }
-
     //main process tells node to join pre-existing system through one contact
     Join(self, contact, contact_id) -> {
       io.println("received start message")
