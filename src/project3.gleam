@@ -1,7 +1,7 @@
 import gleam/bit_array
 import gleam/crypto
 import gleam/dict
-import gleam/erlang/process.{type Subject, send_after}
+import gleam/erlang/process.{type Subject, receive, send_after}
 import gleam/float
 import gleam/int
 import gleam/io
@@ -11,23 +11,37 @@ import gleam/otp/actor
 import gleam/pair
 import gleam/string
 
-//import gleam/results
-
 pub fn main() -> Nil {
+  //TODO: read num_nodes and num_queries from command line
   let num_nodes = 30
-  let num_resources = 100
-  //Generate a number of resources by hashing intergers from 1 to num_resources
-  let _keys = create_keys(num_resources)
-  //generate n nodes to be joined to the chord
-  let nodes_dict = create_nodes(num_nodes)
+  let num_queries = 10
+  //set up place to receive results
+  let reply_subject = process.new_subject()
+
+  //set up monitor and pass data to nodes
+  let _total_queries = num_nodes * num_queries
+  //TODO: change 100 to total_queries 
+  let monitor_state = MonitorState(0, 0, reply_subject, 60)
+  let assert Ok(monitor) =
+    actor.new(monitor_state)
+    |> actor.on_message(monitor_handle_message)
+    |> actor.start
+
+  //generate n nodes to be joined to the chord with monitor data
+  let nodes_dict = create_nodes(num_nodes, monitor.data)
   //for cheaper iteration
   let nodes_list = dict.to_list(nodes_dict)
-  echo nodes_list
   //build chord
-  build_chord(num_nodes, nodes_list)
-  io.println("starting node")
-  //actor.send(node.data, Start(node.data))
-  process.sleep(5000)
+  build_chord(num_nodes, nodes_list, num_queries)
+
+  case receive(reply_subject, 10_000) {
+    Ok(results) -> {
+      io.println("finished! results: " <> float.to_string(results))
+    }
+    Error(_) -> {
+      io.println("timeout")
+    }
+  }
   Nil
 }
 
@@ -38,26 +52,14 @@ fn key_hash(key: String) -> Int {
   num
 }
 
-fn create_keys(index: Int) -> List(Int) {
+fn create_nodes(
+  index: Int,
+  reply_subject: Subject(MonitorMessage),
+) -> dict.Dict(Int, Subject(Message)) {
   case index {
     1 -> {
-      let hash = key_hash(int.to_string(index))
-      [hash]
-    }
-    _ -> {
-      let existing_list = create_keys(index - 1)
-
-      let hash = key_hash(int.to_string(index))
-      let new_list = list.append(existing_list, [hash])
-      new_list
-    }
-  }
-}
-
-fn create_nodes(index: Int) -> dict.Dict(Int, Subject(Message)) {
-  case index {
-    1 -> {
-      let actor_state = State(None, 0, None, 0, None, 0, dict.new())
+      let actor_state =
+        State(None, 0, None, 0, None, 0, dict.new(), reply_subject)
       let assert Ok(node) =
         actor.new(actor_state)
         |> actor.on_message(worker_handle_message)
@@ -69,9 +71,10 @@ fn create_nodes(index: Int) -> dict.Dict(Int, Subject(Message)) {
     }
     _ -> {
       let new_index = index - 1
-      let nodes = create_nodes(new_index)
+      let nodes = create_nodes(new_index, reply_subject)
 
-      let actor_state = State(None, 0, None, 0, None, 0, dict.new())
+      let actor_state =
+        State(None, 0, None, 0, None, 0, dict.new(), reply_subject)
       let assert Ok(node) =
         actor.new(actor_state)
         |> actor.on_message(worker_handle_message)
@@ -86,6 +89,7 @@ fn create_nodes(index: Int) -> dict.Dict(Int, Subject(Message)) {
 fn build_chord(
   index: Int,
   nodes: List(#(Int, Subject(Message))),
+  num_queries: Int,
 ) -> #(Subject(Message), Int) {
   case index {
     1 -> {
@@ -93,10 +97,9 @@ fn build_chord(
       let assert Ok(node) = list.first(nodes)
       let subject = pair.second(node)
       let id = pair.first(node)
-      //Join with no successor and no predesssor responsible for all nodes
-      //create a function for just 1 node in that is responsbile for all nodes
-      //TODO
 
+      io.println("initializing node 1")
+      actor.send(subject, Start(subject, num_queries))
       //pass back this node as the reference for the next node
       #(subject, id)
     }
@@ -107,45 +110,61 @@ fn build_chord(
       let id = pair.first(node)
       let assert Ok(nodes) = list.rest(nodes)
       //get reference node from the node before you
-      let ref_node = build_chord(index - 1, nodes)
+      let ref_node = build_chord(index - 1, nodes, num_queries)
       let ref_id = pair.first(ref_node)
       let ref_subject = pair.second(ref_node)
-      actor.send(subject, Join(subject, ref_id, ref_subject))
+      //io.println("sending join message " <> int.to_string(index))
+      actor.send(subject, Join(subject, ref_id, ref_subject, num_queries))
       #(subject, id)
     }
   }
 }
 
-pub fn lookup(state: State) {
-  let n = 100
-  //TODO: change n to however many keys we use
+pub fn lookup(num_queries: Int, state: State) {
+  case num_queries {
+    0 -> {
+      //after n queries, finish
+      Nil
+    }
+    _ -> {
+      let assert Ok(n) = int.power(2, 160.0)
 
-  //pick random key to query
-  let random = int.random(n)
+      //pick random key to query
+      let random = int.random(float.round(n))
 
-  //TODO: convert chosen key to hashed key id
-  let hash = random
+      //get next hop towards key
+      let target = get_next_hop(random, state)
+      let target_subject = pair.second(target)
+      let assert Some(self) = state.self
 
-  //get next hop towards key
-  let target = get_next_hop(hash, state)
-  let target_subject = pair.second(target)
-  let assert Some(self) = state.self
+      //send query to the next hop with return information and number of hops initialized to 0
+      actor.send(target_subject, Query(self, state.self_id, random, 0))
 
-  //send query to the next hop with return information and number of hops initialized to 0
-  actor.send(target_subject, Query(self, state.self_id, hash, 0))
+      //resend query trigger and decrement
+      let assert Some(self) = state.self
+      send_after(self, 1000, QueryTrigger(num_queries - 1))
+      Nil
+    }
+  }
 }
 
 pub fn get_next_hop(key: Int, state: State) -> #(Int, Subject(Message)) {
   let key_dist = distance(state.self_id, key)
   let succ_dist = distance(state.self_id, state.succ_id)
+  let pred_dist = distance(state.self_id, state.pred_id)
   //if key is closer to you than your successor, it is within their range
-  case key_dist <= succ_dist {
-    True -> {
+  case key_dist {
+    i if i <= succ_dist -> {
       //key is between you and your successor, so you know your successor has it
       let assert Some(succ) = state.succ
       #(state.succ_id, succ)
     }
-    False -> {
+    i if i > pred_dist -> {
+      //key is between you and your predecessor, so it is yours
+      let assert Some(self) = state.self
+      #(state.self_id, self)
+    }
+    _ -> {
       //try to get as close as possible without overshooting
       closest_preceding_node(key, state)
     }
@@ -174,6 +193,7 @@ pub fn update_contacts(
           -1
         }
         False -> {
+          //returns -1 if dist is 0
           get_routing_position(pair.first(lower_contact), state.self_id)
         }
       }
@@ -184,6 +204,7 @@ pub fn update_contacts(
           -1
         }
         False -> {
+          //also returns -1 if distance is zero, node's neighbor is itself
           get_routing_position(pair.first(higher_contact), state.self_id)
         }
       }
@@ -232,24 +253,32 @@ pub fn get_routing_position(key: Int, start: Int) -> Int {
 
   //measuring distance from start key
   let diff = distance(start, key)
-  let diff_float = int.to_float(diff) +. 0.001
-
-  //get log_2 of difference
-  let log_val = log2(diff_float)
-
-  //round down and convert to int
-  let floor_val = float.floor(log_val)
-  let val_int = float.round(floor_val)
-  val_int
+  case diff > 0 {
+    True -> {
+      //get log of dist to key
+      let diff_float = int.to_float(diff)
+      case log2(diff_float) {
+        Some(log_val) -> {
+          //round down and convert to int
+          let floor_val = float.floor(log_val)
+          let val_int = float.round(floor_val)
+          val_int
+        }
+        None -> -1
+      }
+    }
+    False -> -1
+  }
 }
 
-pub fn log2(n: Float) -> Float {
-  //float.logarithm uses base e, so use change of bases formula
-  let assert Ok(log_e_n) = float.logarithm(n)
-  let assert Ok(log_e_2) = float.logarithm(2.0)
-
-  let log_2_n = log_e_n /. log_e_2
-  log_2_n
+pub fn log2(n: Float) -> Option(Float) {
+  case float.logarithm(n) {
+    Ok(log_e_n) -> {
+      let assert Ok(log_e_2) = float.logarithm(2.0)
+      Some(log_e_n /. log_e_2)
+    }
+    Error(_) -> None
+  }
 }
 
 pub fn closest_preceding_node(
@@ -334,14 +363,13 @@ pub fn closest_following_node(
 }
 
 pub fn distance(start: Int, end: Int) -> Int {
-  //TODO: CHANGE TO FINAL VALUE
-  let circle_size = 10_000
+  let assert Ok(circle_size) = int.power(2, 160.0)
   //this value can either be positive or negative
   let diff = end - start
   //if diff is negative, we must wrap around the circle
   case diff >= 0 {
     True -> diff
-    False -> circle_size + diff
+    False -> float.round(circle_size) + diff
   }
 }
 
@@ -367,6 +395,7 @@ pub fn update_state(
         state.pred,
         state.pred_id,
         updated_contacts,
+        state.monitor,
       )
     }
     False -> {
@@ -381,6 +410,7 @@ pub fn update_state(
             Some(sender),
             sender_id,
             updated_contacts,
+            state.monitor,
           )
         }
         False -> {
@@ -393,6 +423,7 @@ pub fn update_state(
             state.pred,
             state.pred_id,
             updated_contacts,
+            state.monitor,
           )
         }
       }
@@ -414,14 +445,21 @@ pub type State {
     pred_id: Int,
     //keep list of other contacts for larger hops
     contacts: dict.Dict(Int, Subject(Message)),
+    //monitor data to send results
+    monitor: Subject(MonitorMessage),
   )
 }
 
 pub type Message {
   //for first node in system
-  Start(self: Subject(Message))
+  Start(self: Subject(Message), num_queries: Int)
   //for other nodes joining system, given one contact to start
-  Join(self: Subject(Message), contact: Subject(Message), contact_id: Int)
+  Join(
+    self: Subject(Message),
+    contact: Subject(Message),
+    contact_id: Int,
+    num_queries: Int,
+  )
   //node requests data from other nodes
   Query(sender: Subject(Message), sender_id: Int, key: Int, hops: Int)
   //node responds to query 
@@ -441,6 +479,8 @@ pub type Message {
   StabilizeQuery(sender: Subject(Message), sender_id: Int)
   //node responds to stabilize with its own predecessor
   StabilizeResponse(pred: Subject(Message), pred_id: Int)
+  //triggers lookups after contacts have had time to form
+  QueryTrigger(num_queries: Int)
 }
 
 fn worker_handle_message(
@@ -449,46 +489,75 @@ fn worker_handle_message(
 ) -> actor.Next(State, Message) {
   case message {
     //main process tells node to start, it is first in system
-    Start(self) -> {
-      io.println("received start message!")
-      //update state to store your own Subject
+    Start(self, num_queries) -> {
+      //io.println("received start message!")
+      //update state to store your own Subject and id
+      //calculate id
+      let id = key_hash(string.inspect(self))
       let new_state =
         State(
           Some(self),
-          state.self_id,
+          id,
           Some(self),
-          state.self_id,
+          id,
           Some(self),
-          state.self_id,
+          id,
           state.contacts,
+          state.monitor,
         )
 
       //start stabilization cycle
-      send_after(self, 2000, StabilizeTrigger)
+      send_after(self, 100, StabilizeTrigger)
+
+      //set query trigger
+      send_after(self, 1000, QueryTrigger(num_queries))
+
       actor.continue(new_state)
     }
     //main process tells node to join pre-existing system through one contact
-    Join(self, contact, contact_id) -> {
-      io.println("received start message")
+    Join(self, contact, contact_id, num_queries) -> {
+      //io.println("received join message")
       //use contact to find successor
       actor.send(contact, SuccessorQuery(self, state.self_id))
       //will get response as separate message
-      //update contacts with your first contact
-      let updated_contacts = update_contacts(contact, contact_id, state)
 
+      //calculate your id
+      let id = key_hash(string.inspect(self))
+
+      //update contacts with your first contact
+      let state_with_self =
+        State(
+          Some(self),
+          id,
+          Some(contact),
+          contact_id,
+          Some(contact),
+          contact_id,
+          state.contacts,
+          state.monitor,
+        )
+
+      let updated_contacts =
+        update_contacts(contact, contact_id, state_with_self)
+
+      //update state
       let new_state =
         State(
           Some(self),
-          state.self_id,
+          id,
           Some(contact),
           contact_id,
           Some(contact),
           contact_id,
           updated_contacts,
+          state.monitor,
         )
 
       //start stabilizing cycle, sending to your predecessor, the new contact
-      send_after(contact, 2000, StabilizeTrigger)
+      send_after(contact, 100, StabilizeTrigger)
+
+      //set query trigger
+      send_after(self, 1000, QueryTrigger(num_queries))
 
       actor.continue(new_state)
     }
@@ -500,11 +569,13 @@ fn worker_handle_message(
       let key_dist = distance(state.self_id, key)
       case key_dist > pred_dist {
         True -> {
+          io.println("i have it!")
           let assert Some(self) = state.self
           actor.send(sender, Response(self, state.self_id, hops + 1))
         }
         //else, pass the request on with incremented hops
         False -> {
+          io.println("passing it on...")
           let target = get_next_hop(key, state)
           actor.send(
             pair.second(target),
@@ -518,14 +589,13 @@ fn worker_handle_message(
       actor.continue(new_state)
     }
 
-    Response(sender, sender_id, _hops) -> {
-      io.println("received a response")
+    Response(sender, sender_id, hops) -> {
+      io.println("received a response with " <> int.to_string(hops) <> " hops")
       //update contacts with sender's info
       let new_state = update_state(sender, sender_id, state)
 
-      //TODO:
-      //send monitor number of hops it took
-      //maybe change to also get info of sender for adding to contacts
+      //send monitor the query results
+      actor.send(state.monitor, QueryResults(hops))
       actor.continue(new_state)
     }
 
@@ -556,6 +626,7 @@ fn worker_handle_message(
             Some(sender),
             sender_id,
             updated_contacts,
+            state.monitor,
           )
         }
         False -> {
@@ -571,6 +642,7 @@ fn worker_handle_message(
             state.pred,
             state.pred_id,
             updated_contacts,
+            state.monitor,
           )
         }
       }
@@ -590,6 +662,7 @@ fn worker_handle_message(
           state.pred,
           state.pred_id,
           contacts_with_succ,
+          state.monitor,
         )
       let final_contacts = update_contacts(pred, pred_id, state_with_succ)
       //get final state with pred, succ, and final contacts
@@ -602,6 +675,7 @@ fn worker_handle_message(
           Some(pred),
           pred_id,
           final_contacts,
+          state.monitor,
         )
 
       actor.continue(final_state)
@@ -614,7 +688,7 @@ fn worker_handle_message(
       actor.send(succ, StabilizeQuery(self, state.self_id))
 
       //resend trigger to yourself after some time
-      send_after(self, 2000, StabilizeTrigger)
+      send_after(self, 100, StabilizeTrigger)
       actor.continue(state)
     }
     StabilizeQuery(sender, sender_id) -> {
@@ -638,6 +712,55 @@ fn worker_handle_message(
         False -> {
           //new successor
           let new_state = update_state(result, result_id, state)
+          actor.continue(new_state)
+        }
+      }
+    }
+    QueryTrigger(num_queries) -> {
+      //send out a query
+      lookup(num_queries, state)
+      actor.continue(state)
+    }
+  }
+}
+
+pub type MonitorState {
+  MonitorState(
+    num_queries: Int,
+    num_hops: Int,
+    reply_subject: Subject(Float),
+    expected_num: Int,
+  )
+}
+
+pub type MonitorMessage {
+  QueryResults(hops: Int)
+}
+
+fn monitor_handle_message(
+  state: MonitorState,
+  message: MonitorMessage,
+) -> actor.Next(MonitorState, MonitorMessage) {
+  case message {
+    QueryResults(hops) -> {
+      case state.num_queries == state.expected_num {
+        True -> {
+          //we have received all the results, now calculate average
+          let average =
+            { int.to_float(state.num_hops + hops) }
+            /. { int.to_float(state.num_queries + 1) }
+          //send results to main process
+          actor.send(state.reply_subject, average)
+          actor.stop()
+        }
+        False -> {
+          let new_state =
+            MonitorState(
+              state.num_queries + 1,
+              state.num_hops + hops,
+              state.reply_subject,
+              state.expected_num,
+            )
           actor.continue(new_state)
         }
       }
