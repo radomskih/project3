@@ -13,7 +13,7 @@ import gleam/string
 
 pub fn main() -> Nil {
   //TODO: read num_nodes and num_queries from command line
-  let num_nodes = 30
+  let num_nodes = 1000
   let num_queries = 10
   //set up place to receive results
   let reply_subject = process.new_subject()
@@ -21,7 +21,7 @@ pub fn main() -> Nil {
   //set up monitor and pass data to nodes
   let _total_queries = num_nodes * num_queries
   //TODO: change 100 to total_queries 
-  let monitor_state = MonitorState(0, 0, reply_subject, 60)
+  let monitor_state = MonitorState(0, 0, reply_subject, 500)
   let assert Ok(monitor) =
     actor.new(monitor_state)
     |> actor.on_message(monitor_handle_message)
@@ -34,7 +34,7 @@ pub fn main() -> Nil {
   //build chord
   build_chord(num_nodes, nodes_list, num_queries)
 
-  case receive(reply_subject, 10_000) {
+  case receive(reply_subject, 20_000) {
     Ok(results) -> {
       io.println("finished! results: " <> float.to_string(results))
     }
@@ -142,7 +142,7 @@ pub fn lookup(num_queries: Int, state: State) {
 
       //resend query trigger and decrement
       let assert Some(self) = state.self
-      send_after(self, 1000, QueryTrigger(num_queries - 1))
+      send_after(self, 100, QueryTrigger(num_queries - 1))
       Nil
     }
   }
@@ -481,6 +481,9 @@ pub type Message {
   StabilizeResponse(pred: Subject(Message), pred_id: Int)
   //triggers lookups after contacts have had time to form
   QueryTrigger(num_queries: Int)
+  FixFingerTrigger(last_finger: Int)
+  FixFingerQuery(sender: Subject(Message), sender_id: Int, key: Int)
+  FixFingerResponse(contact: Subject(Message), contact_id: Int)
 }
 
 fn worker_handle_message(
@@ -506,8 +509,9 @@ fn worker_handle_message(
           state.monitor,
         )
 
-      //start stabilization cycle
+      //start stabilization cycle and fix finger cycle
       send_after(self, 100, StabilizeTrigger)
+      send_after(self, 100, FixFingerTrigger(160))
 
       //set query trigger
       send_after(self, 1000, QueryTrigger(num_queries))
@@ -553,8 +557,9 @@ fn worker_handle_message(
           state.monitor,
         )
 
-      //start stabilizing cycle, sending to your predecessor, the new contact
-      send_after(contact, 100, StabilizeTrigger)
+      //start stabilizing cycle and finger fix trigger
+      send_after(self, 10, StabilizeTrigger)
+      send_after(self, 10, FixFingerTrigger(160))
 
       //set query trigger
       send_after(self, 1000, QueryTrigger(num_queries))
@@ -562,20 +567,20 @@ fn worker_handle_message(
       actor.continue(new_state)
     }
     Query(sender, sender_id, key, hops) -> {
-      io.println("received a request")
+      //io.println("received a request")
       //if you have the key, send the response
       //key must be further  around circle than predecessor to be yours
       let pred_dist = distance(state.self_id, state.pred_id)
       let key_dist = distance(state.self_id, key)
       case key_dist > pred_dist {
         True -> {
-          io.println("i have it!")
+          //io.println("i have it!")
           let assert Some(self) = state.self
           actor.send(sender, Response(self, state.self_id, hops + 1))
         }
         //else, pass the request on with incremented hops
         False -> {
-          io.println("passing it on...")
+          //io.println("passing it on...")
           let target = get_next_hop(key, state)
           actor.send(
             pair.second(target),
@@ -720,6 +725,64 @@ fn worker_handle_message(
       //send out a query
       lookup(num_queries, state)
       actor.continue(state)
+    }
+    FixFingerTrigger(last_finger) -> {
+      //determine the size of the finger table, based on the id space
+      let assert Ok(size) = int.power(2, 160.0)
+      let assert Some(range) = log2(size)
+      let num_fingers = float.round(float.floor(range))
+
+      //pick next finger, with randomized step size from previous finger
+      let next_finger = { last_finger - int.random(3) - 1 } % num_fingers
+      //calculate what key this finger corresponds to
+      let assert Ok(offset) = int.power(2, int.to_float(next_finger) -. 1.0)
+      let search_key =
+        { state.self_id + float.round(offset) } % float.round(size)
+
+      //get next hop towards this key
+      let target = get_next_hop(search_key, state)
+
+      //send query off to target
+      let assert Some(self) = state.self
+      actor.send(
+        pair.second(target),
+        FixFingerQuery(self, state.self_id, search_key),
+      )
+
+      //retrigger next fix-finger
+      send_after(self, 100, FixFingerTrigger(next_finger))
+      actor.continue(state)
+    }
+    FixFingerQuery(sender, sender_id, key) -> {
+      //a node is looking for another node that is as close to this key as possible without being closer
+      //handle similar to regular query
+      let pred_dist = distance(state.self_id, state.pred_id)
+      let key_dist = distance(state.self_id, key)
+      case key_dist > pred_dist {
+        True -> {
+          //key is in your range, you fit their entry perfectly
+          let assert Some(self) = state.self
+          actor.send(sender, FixFingerResponse(self, state.self_id))
+        }
+        //else, pass the request on 
+        False -> {
+          let target = get_next_hop(key, state)
+          actor.send(
+            pair.second(target),
+            FixFingerQuery(sender, sender_id, key),
+          )
+        }
+      }
+      //update contacts with sender info
+      let new_state = update_state(sender, sender_id, state)
+
+      actor.continue(new_state)
+    }
+    FixFingerResponse(contact, contact_id) -> {
+      //received response from your finger query
+      //update your state and move on
+      let new_state = update_state(contact, contact_id, state)
+      actor.continue(new_state)
     }
   }
 }
