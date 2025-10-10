@@ -586,6 +586,12 @@ fn worker_handle_message(
       actor.continue(new_state)
     }
     Query(sender, sender_id, key, hops) -> {
+      case hops > 99 && hops % 100 == 0 {
+        True -> {
+          io.println("message running wild! (key " <> int.to_string(key) <> ")")
+        }
+        False -> Nil
+      }
       //io.println("received a request")
       //if you have the key, send the response
       //key must be further  around circle than predecessor to be yours
@@ -627,7 +633,7 @@ fn worker_handle_message(
     }
 
     Response(sender, sender_id, hops) -> {
-      io.println("received a response with " <> int.to_string(hops) <> " hops")
+      //io.println("received a response with " <> int.to_string(hops) <> " hops")
       //update contacts with sender's info
       let new_state = update_state(sender, sender_id, state)
 
@@ -868,7 +874,7 @@ fn monitor_handle_message(
 ) -> actor.Next(MonitorState, MonitorMessage) {
   case message {
     QueryResults(hops) -> {
-      case state.num_queries == state.expected_num {
+      case state.num_queries + 1 == state.expected_num {
         True -> {
           //we have received all the results, now calculate average
           let average =
