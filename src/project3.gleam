@@ -1,4 +1,5 @@
 import gleam/bit_array
+import gleam/bool
 import gleam/crypto
 import gleam/dict
 import gleam/erlang/process.{type Subject, receive, send_after}
@@ -13,7 +14,7 @@ import gleam/string
 
 pub fn main() -> Nil {
   //TODO: read num_nodes and num_queries from command line
-  let num_nodes = 1000
+  let num_nodes = 50
   let num_queries = 10
   //set up place to receive results
   let reply_subject = process.new_subject()
@@ -34,7 +35,7 @@ pub fn main() -> Nil {
   //build chord
   build_chord(num_nodes, nodes_list, num_queries)
 
-  case receive(reply_subject, 20_000) {
+  case receive(reply_subject, 4500) {
     Ok(results) -> {
       io.println("finished! results: " <> float.to_string(results))
     }
@@ -111,10 +112,10 @@ fn build_chord(
       let assert Ok(nodes) = list.rest(nodes)
       //get reference node from the node before you
       let ref_node = build_chord(index - 1, nodes, num_queries)
-      let ref_id = pair.first(ref_node)
-      let ref_subject = pair.second(ref_node)
+      let ref_subject = pair.first(ref_node)
+      let ref_id = key_hash(string.inspect(ref_subject))
       //io.println("sending join message " <> int.to_string(index))
-      actor.send(subject, Join(subject, ref_id, ref_subject, num_queries))
+      actor.send(subject, Join(subject, ref_subject, ref_id, num_queries))
       #(subject, id)
     }
   }
@@ -178,7 +179,11 @@ pub fn update_contacts(
 ) -> dict.Dict(Int, Subject(Message)) {
   //this function maintains the finger table
   //each time a new node is recognized, we decide if we should keep it as a contact
-  case dict.has_key(state.contacts, candidate_id) {
+  case
+    dict.has_key(state.contacts, candidate_id)
+    || candidate_id == state.self_id
+    || candidate_id == 0
+  {
     //if candidate is already in contacts, no change
     True -> state.contacts
     False -> {
@@ -219,8 +224,8 @@ pub fn update_contacts(
 
       case lower_routing_position == candidate_routing_position {
         True -> {
-          //current contact and candidate would fill same spot in table
-          //current contact is lower than candidate, so it is preferable
+          //pre-existing contact and candidate would fill same spot in table
+          //this pre-existing contact is lower than candidate, so it is preferable
           //do not add candidate, return contacts as is
           state.contacts
         }
@@ -316,8 +321,8 @@ pub fn closest_preceding_node(
     Ok(target) -> #(target_id, target)
     //if there was no valid contact, return 0 to communicate that
     Error(_) -> {
-      let assert Some(self) = state.self
-      #(0, self)
+      let assert Some(succ) = state.succ
+      #(0, succ)
     }
   }
 }
@@ -384,19 +389,35 @@ pub fn update_state(
   let pred_dist = distance(state.self_id, state.pred_id)
   let succ_dist = distance(state.self_id, state.succ_id)
   let sender_dist = distance(state.self_id, sender_id)
-  case sender_dist < succ_dist {
+  case { sender_dist != 0 && sender_dist < succ_dist } || succ_dist == 0 {
     True -> {
       //sender is closer than successor, it should be the new successor
-      State(
-        state.self,
-        state.self_id,
-        Some(sender),
-        sender_id,
-        state.pred,
-        state.pred_id,
-        updated_contacts,
-        state.monitor,
-      )
+      case pred_dist == 0 {
+        True -> {
+          State(
+            state.self,
+            state.self_id,
+            Some(sender),
+            sender_id,
+            Some(sender),
+            sender_id,
+            updated_contacts,
+            state.monitor,
+          )
+        }
+        False -> {
+          State(
+            state.self,
+            state.self_id,
+            Some(sender),
+            sender_id,
+            state.pred,
+            state.pred_id,
+            updated_contacts,
+            state.monitor,
+          )
+        }
+      }
     }
     False -> {
       case sender_dist > pred_dist {
@@ -429,8 +450,6 @@ pub fn update_state(
       }
     }
   }
-  //add sender to contacts
-  //create new state
 }
 
 pub type State {
@@ -510,23 +529,23 @@ fn worker_handle_message(
         )
 
       //start stabilization cycle and fix finger cycle
-      send_after(self, 100, StabilizeTrigger)
-      send_after(self, 100, FixFingerTrigger(160))
+      send_after(self, 10, StabilizeTrigger)
+      send_after(self, 10, FixFingerTrigger(0))
 
       //set query trigger
-      send_after(self, 1000, QueryTrigger(num_queries))
+      send_after(self, 1500, QueryTrigger(num_queries))
 
       actor.continue(new_state)
     }
     //main process tells node to join pre-existing system through one contact
     Join(self, contact, contact_id, num_queries) -> {
       //io.println("received join message")
-      //use contact to find successor
-      actor.send(contact, SuccessorQuery(self, state.self_id))
-      //will get response as separate message
-
       //calculate your id
       let id = key_hash(string.inspect(self))
+
+      //use contact to find successor
+      actor.send(contact, SuccessorQuery(self, id))
+      //will get response as separate message
 
       //update contacts with your first contact
       let state_with_self =
@@ -559,10 +578,10 @@ fn worker_handle_message(
 
       //start stabilizing cycle and finger fix trigger
       send_after(self, 10, StabilizeTrigger)
-      send_after(self, 10, FixFingerTrigger(160))
+      send_after(self, 10, FixFingerTrigger(0))
 
       //set query trigger
-      send_after(self, 1000, QueryTrigger(num_queries))
+      send_after(self, 1500, QueryTrigger(num_queries))
 
       actor.continue(new_state)
     }
@@ -572,7 +591,18 @@ fn worker_handle_message(
       //key must be further  around circle than predecessor to be yours
       let pred_dist = distance(state.self_id, state.pred_id)
       let key_dist = distance(state.self_id, key)
-      case key_dist > pred_dist {
+      //io.println(
+      // "my range: "
+      //<> int.to_string(state.pred_id)
+      //<> " to "
+      // <> int.to_string(state.self_id)
+      // <> ", key: "
+      // <> int.to_string(key)
+      // <> bool.to_string(key_dist > pred_dist)
+      // <> " sending to "
+      // <> int.to_string(pair.first(get_next_hop(key, state))),
+      //)
+      case key_dist > pred_dist || key_dist == 0 {
         True -> {
           //io.println("i have it!")
           let assert Some(self) = state.self
@@ -582,6 +612,8 @@ fn worker_handle_message(
         False -> {
           //io.println("passing it on...")
           let target = get_next_hop(key, state)
+
+          //otherwise, pass it on
           actor.send(
             pair.second(target),
             Query(sender, sender_id, key, hops + 1),
@@ -612,10 +644,10 @@ fn worker_handle_message(
       //the distance to sender must be larger than distance to predecessor
       let sender_dist = distance(state.self_id, sender_id)
       let pred_dist = distance(state.self_id, state.pred_id)
-      //if you had yourself previously stored as your own predecessor, automatically change it
+      //if you had yourself previously stored as your own predecessor (you were the first node), automatically change it
       let new_state = case sender_dist > pred_dist || pred_dist == 0 {
         True -> {
-          //you are their successor, your prev predecessor is now theirs
+          //you are their successor, your prev predecessor is now their predecessor
           let assert Some(self) = state.self
           let assert Some(pred) = state.pred
           actor.send(
@@ -638,17 +670,46 @@ fn worker_handle_message(
           //you are not their successor, pass query along
           //next_hop will either be the right successor or the closest you can get without overshooting
           let next_hop = get_next_hop(sender_id, state)
-          actor.send(pair.second(next_hop), SuccessorQuery(sender, sender_id))
-          State(
-            state.self,
-            state.self_id,
-            state.succ,
-            state.succ_id,
-            state.pred,
-            state.pred_id,
-            updated_contacts,
-            state.monitor,
-          )
+
+          case pair.first(next_hop) == 0 && sender_dist != 0 {
+            True -> {
+              //your successor will be their successor, you will be their predecessor
+              let assert Some(succ) = state.succ
+              let assert Some(self) = state.self
+              actor.send(
+                sender,
+                SuccessorResponse(succ, state.succ_id, self, state.self_id),
+              )
+
+              //they will be your successor, update your state
+              State(
+                state.self,
+                state.self_id,
+                Some(sender),
+                sender_id,
+                state.pred,
+                state.pred_id,
+                updated_contacts,
+                state.monitor,
+              )
+            }
+            False -> {
+              actor.send(
+                pair.second(next_hop),
+                SuccessorQuery(sender, sender_id),
+              )
+              State(
+                state.self,
+                state.self_id,
+                state.succ,
+                state.succ_id,
+                state.pred,
+                state.pred_id,
+                updated_contacts,
+                state.monitor,
+              )
+            }
+          }
         }
       }
       actor.continue(new_state)
@@ -733,7 +794,7 @@ fn worker_handle_message(
       let num_fingers = float.round(float.floor(range))
 
       //pick next finger, with randomized step size from previous finger
-      let next_finger = { last_finger - int.random(3) - 1 } % num_fingers
+      let next_finger = { last_finger + int.random(3) + 1 } % num_fingers
       //calculate what key this finger corresponds to
       let assert Ok(offset) = int.power(2, int.to_float(next_finger) -. 1.0)
       let search_key =
@@ -749,6 +810,7 @@ fn worker_handle_message(
         FixFingerQuery(self, state.self_id, search_key),
       )
 
+      //io.println(int.to_string(dict.size(state.contacts)))
       //retrigger next fix-finger
       send_after(self, 100, FixFingerTrigger(next_finger))
       actor.continue(state)
@@ -817,6 +879,19 @@ fn monitor_handle_message(
           actor.stop()
         }
         False -> {
+          case state.num_queries % 5 == 0 {
+            True -> {
+              let percent =
+                int.to_float(state.num_queries)
+                /. int.to_float(state.expected_num)
+
+              io.println(float.to_string(percent *. 100.0) <> "% complete!")
+            }
+            False -> {
+              Nil
+            }
+          }
+
           let new_state =
             MonitorState(
               state.num_queries + 1,
