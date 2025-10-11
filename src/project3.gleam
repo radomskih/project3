@@ -1,3 +1,4 @@
+import argv
 import gleam/bit_array
 import gleam/crypto
 import gleam/dict
@@ -12,9 +13,14 @@ import gleam/pair
 import gleam/string
 
 pub fn main() -> Nil {
-  //TODO: read num_nodes and num_queries from command line
-  let num_nodes = 50
-  let num_queries = 10
+  let assert Ok(args) = list.rest(argv.load().arguments)
+  //get num of nodes
+  let assert Ok(num_string) = list.first(args)
+  let assert Ok(num_nodes) = int.parse(num_string)
+  //throw away num nodes and get topology
+  let assert Ok(num_string) = list.first(args)
+  let assert Ok(num_queries) = int.parse(num_string)
+
   //set up place to receive results
   let reply_subject = process.new_subject()
 
@@ -31,7 +37,6 @@ pub fn main() -> Nil {
   //for cheaper iteration
   let nodes_list = dict.to_list(nodes_dict)
   //build chord
-  io.println("Building network and initiating setup...")
   build_chord(num_nodes, nodes_list, num_queries)
 
   case receive(reply_subject, 15_000) {
@@ -98,7 +103,7 @@ fn build_chord(
       let subject = pair.second(node)
       let id = pair.first(node)
 
-      //io.println("initializing node 1")
+      io.println("initializing node 1")
       actor.send(subject, Start(subject, num_queries))
       //pass back this node as the reference for the next node
       #(subject, id)
@@ -151,13 +156,18 @@ pub fn lookup(num_queries: Int, state: State) {
 pub fn get_next_hop(key: Int, state: State) -> #(Int, Subject(Message)) {
   let key_dist = distance(state.self_id, key)
   let succ_dist = distance(state.self_id, state.succ_id)
-  let _pred_dist = distance(state.self_id, state.pred_id)
+  let pred_dist = distance(state.self_id, state.pred_id)
   //if key is closer to you than your successor, it is within their range
   case key_dist {
     i if i <= succ_dist -> {
       //key is between you and your successor, so you know your successor has it
       let assert Some(succ) = state.succ
       #(state.succ_id, succ)
+    }
+    i if i > pred_dist -> {
+      //key is between you and your predecessor, so it is yours
+      let assert Some(self) = state.self
+      #(state.self_id, self)
     }
     _ -> {
       //try to get as close as possible without overshooting
@@ -383,7 +393,7 @@ pub fn update_state(
   let pred_dist = distance(state.self_id, state.pred_id)
   let succ_dist = distance(state.self_id, state.succ_id)
   let sender_dist = distance(state.self_id, sender_id)
-  case sender_dist != 0 && { sender_dist < succ_dist || succ_dist == 0 } {
+  case { sender_dist != 0 && sender_dist < succ_dist } || succ_dist == 0 {
     True -> {
       //sender is closer than successor, it should be the new successor
       case pred_dist == 0 {
@@ -525,6 +535,9 @@ fn worker_handle_message(
       //start stabilization cycle and fix finger cycle
       send_after(self, 10, StabilizeTrigger)
       send_after(self, 10, FixFingerTrigger(0))
+
+      //set query trigger
+      send_after(self, 1500, QueryTrigger(num_queries))
       //set query trigger
       send_after(self, 2500, QueryTrigger(num_queries))
 
@@ -569,10 +582,12 @@ fn worker_handle_message(
           state.monitor,
         )
 
-      //start finger fix trigger
+      //start stabilizing cycle and finger fix trigger
+      send_after(self, 10, StabilizeTrigger)
       send_after(self, 10, FixFingerTrigger(0))
 
       //set query trigger
+      send_after(self, 1500, QueryTrigger(num_queries))
       send_after(self, 2500, QueryTrigger(num_queries))
 
       actor.continue(new_state)
@@ -583,10 +598,6 @@ fn worker_handle_message(
           io.println("message running wild! (key " <> int.to_string(key) <> ")")
         }
         False -> Nil
-      }
-      let hops = case sender_id == state.self_id {
-        True -> 0
-        False -> hops
       }
       //io.println("received a request")
       //if you have the key, send the response
@@ -726,14 +737,35 @@ fn worker_handle_message(
     }
 
     SuccessorResponse(succ, succ_id, pred, pred_id) -> {
-      let state_with_succ = update_state(succ, succ_id, state)
-      let state_with_pred = update_state(pred, pred_id, state_with_succ)
+      //get contacts with predecessor added
+      let contacts_with_succ = update_contacts(succ, succ_id, state)
+      //update state to pass through update_contacts again
+      let state_with_succ =
+        State(
+          state.self,
+          state.self_id,
+          state.succ,
+          state.succ_id,
+          state.pred,
+          state.pred_id,
+          contacts_with_succ,
+          state.monitor,
+        )
+      let final_contacts = update_contacts(pred, pred_id, state_with_succ)
+      //get final state with pred, succ, and final contacts
+      let final_state =
+        State(
+          state.self,
+          state.self_id,
+          Some(succ),
+          succ_id,
+          Some(pred),
+          pred_id,
+          final_contacts,
+          state.monitor,
+        )
 
-      //now that you have your neighbors, start stabilization cycle
-      let assert Some(self) = state.self
-      send_after(self, 10, StabilizeTrigger)
-
-      actor.continue(state_with_pred)
+      actor.continue(final_state)
     }
 
     StabilizeTrigger -> {
@@ -743,7 +775,7 @@ fn worker_handle_message(
       actor.send(succ, StabilizeQuery(self, state.self_id))
 
       //resend trigger to yourself after some time
-      send_after(self, 10, StabilizeTrigger)
+      send_after(self, 100, StabilizeTrigger)
       actor.continue(state)
     }
     StabilizeQuery(sender, sender_id) -> {
@@ -874,9 +906,7 @@ fn monitor_handle_message(
                 int.to_float(state.num_queries)
                 /. int.to_float(state.expected_num)
 
-              io.println(
-                int.to_string(float.round(percent *. 100.0)) <> "% complete!",
-              )
+              io.println(float.to_string(percent *. 100.0) <> "% complete!")
             }
             False -> {
               Nil
