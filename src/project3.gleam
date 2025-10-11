@@ -19,9 +19,8 @@ pub fn main() -> Nil {
   let reply_subject = process.new_subject()
 
   //set up monitor and pass data to nodes
-  let _total_queries = num_nodes * num_queries
-  //TODO: change 100 to total_queries 
-  let monitor_state = MonitorState(0, 0, reply_subject, 500)
+  let total_queries = num_nodes * num_queries
+  let monitor_state = MonitorState(0, 0, reply_subject, total_queries)
   let assert Ok(monitor) =
     actor.new(monitor_state)
     |> actor.on_message(monitor_handle_message)
@@ -35,7 +34,7 @@ pub fn main() -> Nil {
   io.println("Building network and initiating setup...")
   build_chord(num_nodes, nodes_list, num_queries)
 
-  case receive(reply_subject, 10_000) {
+  case receive(reply_subject, 15_000) {
     Ok(results) -> {
       io.println("finished! results: " <> float.to_string(results))
     }
@@ -143,7 +142,7 @@ pub fn lookup(num_queries: Int, state: State) {
 
       //resend query trigger and decrement
       let assert Some(self) = state.self
-      send_after(self, 100, QueryTrigger(num_queries - 1))
+      send_after(self, 1000, QueryTrigger(num_queries - 1))
       Nil
     }
   }
@@ -527,7 +526,7 @@ fn worker_handle_message(
       send_after(self, 10, StabilizeTrigger)
       send_after(self, 10, FixFingerTrigger(0))
       //set query trigger
-      send_after(self, 5500, QueryTrigger(num_queries))
+      send_after(self, 2500, QueryTrigger(num_queries))
 
       actor.continue(new_state)
     }
@@ -574,7 +573,7 @@ fn worker_handle_message(
       send_after(self, 10, FixFingerTrigger(0))
 
       //set query trigger
-      send_after(self, 5000, QueryTrigger(num_queries))
+      send_after(self, 2500, QueryTrigger(num_queries))
 
       actor.continue(new_state)
     }
@@ -610,6 +609,7 @@ fn worker_handle_message(
           //io.println("i have it!")
           let assert Some(self) = state.self
           actor.send(sender, Response(self, state.self_id, hops + 1))
+          Nil
         }
         //else, pass the request on with incremented hops
         False -> {
@@ -617,10 +617,17 @@ fn worker_handle_message(
           let target = get_next_hop(key, state)
 
           //otherwise, pass it on
-          actor.send(
+          //actor.send(
+          // pair.second(target),
+          // Query(sender, sender_id, key, hops + 1),
+          //)
+
+          send_after(
             pair.second(target),
+            5,
             Query(sender, sender_id, key, hops + 1),
           )
+          Nil
         }
       }
       //update contacts with sender info
