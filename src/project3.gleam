@@ -17,7 +17,8 @@ pub fn main() -> Nil {
   //get num of nodes
   let assert Ok(num_string) = list.first(args)
   let assert Ok(num_nodes) = int.parse(num_string)
-  //throw away num nodes and get topology
+  let assert Ok(args) = list.rest(args)
+  //get num of queries
   let assert Ok(num_string) = list.first(args)
   let assert Ok(num_queries) = int.parse(num_string)
 
@@ -39,7 +40,7 @@ pub fn main() -> Nil {
   //build chord
   build_chord(num_nodes, nodes_list, num_queries)
 
-  case receive(reply_subject, 15_000) {
+  case receive(reply_subject, 50_000) {
     Ok(results) -> {
       io.println("finished! results: " <> float.to_string(results))
     }
@@ -103,7 +104,7 @@ fn build_chord(
       let subject = pair.second(node)
       let id = pair.first(node)
 
-      io.println("initializing node 1")
+      //io.println("initializing node 1")
       actor.send(subject, Start(subject, num_queries))
       //pass back this node as the reference for the next node
       #(subject, id)
