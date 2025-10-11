@@ -143,7 +143,7 @@ pub fn lookup(num_queries: Int, state: State) {
 
       //resend query trigger and decrement
       let assert Some(self) = state.self
-      send_after(self, 100, QueryTrigger(num_queries - 1))
+      send_after(self, 1000, QueryTrigger(num_queries - 1))
       Nil
     }
   }
@@ -526,7 +526,7 @@ fn worker_handle_message(
       //start stabilization cycle and fix finger cycle
       send_after(self, 10, StabilizeTrigger)
       send_after(self, 10, FixFingerTrigger(0))
-      //set query trigger
+      //set query trigger with time to ensure that the finger table is built
       send_after(self, 5500, QueryTrigger(num_queries))
 
       actor.continue(new_state)
