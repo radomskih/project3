@@ -594,12 +594,6 @@ fn worker_handle_message(
       actor.continue(new_state)
     }
     Query(sender, sender_id, key, hops) -> {
-      case hops > 99 && hops % 100 == 0 {
-        True -> {
-          io.println("message running wild! (key " <> int.to_string(key) <> ")")
-        }
-        False -> Nil
-      }
       //io.println("received a request")
       //if you have the key, send the response
       //key must be further  around circle than predecessor to be yours
