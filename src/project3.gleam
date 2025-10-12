@@ -901,19 +901,6 @@ fn monitor_handle_message(
           actor.stop()
         }
         False -> {
-          case state.num_queries % 5 == 0 {
-            True -> {
-              let percent =
-                int.to_float(state.num_queries)
-                /. int.to_float(state.expected_num)
-
-              io.println(float.to_string(percent *. 100.0) <> "% complete!")
-            }
-            False -> {
-              Nil
-            }
-          }
-
           let new_state =
             MonitorState(
               state.num_queries + 1,
